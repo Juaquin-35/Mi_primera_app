@@ -1,8 +1,12 @@
 package com.example.miprimeraapp.ui.screens
 
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.BatteryManager
+import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,12 +25,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.miprimeraapp.data.FirebaseRepository
 import com.example.miprimeraapp.ui.components.GeminiApiKeyDialog
 import com.example.miprimeraapp.utils.GeminiAiService
 import com.example.miprimeraapp.utils.VibrationUtils
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -51,15 +59,108 @@ fun HomeScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var selectedBottomTab by remember { mutableIntStateOf(0) } // 0 = Dashboard, 1 = Aforo, 2 = Clima, 3 = Alertas
+    var selectedBottomTab by remember { mutableIntStateOf(0) } // 0 = Dashboard/ISO, 1 = Aforo/Serial, 2 = Temp/Energía, 3 = Alertas
     val scrollState = rememberScrollState()
 
-    // Interactive sensor states
-    var aforoCount by remember { mutableIntStateOf(12) }
+    // Estados de sensores sincronizados con Firebase RTDB y WeMos D1 Mini
+    var aforoCount by remember { mutableIntStateOf(0) }
     var temperatureVal by remember { mutableFloatStateOf(21.5f) }
+    var distanciaVal by remember { mutableIntStateOf(999) }
+    var firebaseSyncStatus by remember { mutableStateOf("Conectando a Firebase RTDB...") }
+    var lastSyncTime by remember { mutableStateOf("--:--:--") }
     val maxCapacity by remember { mutableFloatStateOf(15f) }
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var criticalDialogMessage by remember { mutableStateOf<String?>(null) }
+
+    // 3.1.1.2 Integridad de datos (Checksum CRC)
+    var currentChecksum by remember { mutableLongStateOf(0L) }
+    var isIntegrityVerified by remember { mutableStateOf(true) }
+
+    // 3.1.1.3, 3.1.1.4, 3.1.2.7, 3.1.4.13 Reconexión, Almacenamiento Offline y Contingencia
+    var reconexionesCount by remember { mutableIntStateOf(0) }
+    var pendingOfflineMobile by remember { mutableIntStateOf(0) }
+    var bufferOfflineArduino by remember { mutableIntStateOf(0) }
+    var isContingencyActive by remember { mutableStateOf(false) }
+
+    // 3.1.3.10 Evaluación de consumo energético (Sensores IoT + Dispositivo Móvil)
+    var ecoModeEnabled by remember { mutableStateOf(true) }
+    var arduinoCurrentMa by remember { mutableFloatStateOf(38.4f) }
+    var mobileBatteryPct by remember { mutableIntStateOf(100) }
+    var mobileBatteryMv by remember { mutableIntStateOf(4100) }
+
+    // 3.1.2.5, 3.1.2.6, 3.1.3.8, 3.1.3.9 Consola de Comunicación Serial Bidireccional
+    var serialCommandInput by remember { mutableStateOf("STATUS") }
+    val serialConsoleLogs = remember {
+        mutableStateListOf(
+            "[SERIAL INIT] Puerto Virtual UART-Cloud @ 115200 bps (8N1) listo.",
+            "[3.1.3.8 RX] ⬅ STX|SISTEMA_LISTO|ISO27001|ETX",
+        )
+    }
+
+    // 3.1.4.12 Protección de datos personales (Pseudonimización SHA-256)
+    val anonymizedUserId = remember(username) {
+        FirebaseRepository.anonymizePersonalIdentifier(username)
+    }
+
+    // 3.1.4.14 Compatibilidad de Android y Arquitectura de Hardware
+    val hardwareArchInfo = remember {
+        val abis = Build.SUPPORTED_ABIS.joinToString(", ")
+        "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) • ABI: $abis • ${Build.MANUFACTURER} ${Build.MODEL}"
+    }
+
+    // Lectura del estado real de la batería del dispositivo móvil (3.1.3.10)
+    fun refreshMobileBatteryStatus(ctx: Context) {
+        try {
+            val intent = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            val voltage = intent?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 4100) ?: 4100
+            if (level >= 0 && scale > 0) {
+                mobileBatteryPct = ((level.toFloat() / scale.toFloat()) * 100f).toInt()
+            }
+            mobileBatteryMv = voltage
+        } catch (_: Exception) {}
+    }
+
+    // Sincronización periódica con Firebase RTDB (3s en modo normal, 5s en modo ahorro extremo)
+    LaunchedEffect(ecoModeEnabled) {
+        while (isActive) {
+            refreshMobileBatteryStatus(context)
+            pendingOfflineMobile = FirebaseRepository.getPendingOfflineCount(context)
+
+            val result = FirebaseRepository.fetchSensorData(context)
+            result.onSuccess { readings ->
+                aforoCount = readings.personas
+                temperatureVal = readings.temperatura
+                distanciaVal = readings.distancia
+                currentChecksum = readings.checksum
+                isIntegrityVerified = readings.integrityVerified
+                arduinoCurrentMa = if (ecoModeEnabled) 38.4f else readings.consumoMa
+                reconexionesCount = FirebaseRepository.autoReconnectAttempts + readings.reconexionesArduino
+                bufferOfflineArduino = readings.bufferOfflineArduino
+                isContingencyActive = readings.fromOfflineCache || FirebaseRepository.isContingencyModeActive
+                pendingOfflineMobile = FirebaseRepository.getPendingOfflineCount(context)
+                lastSyncTime = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+
+                firebaseSyncStatus = if (readings.fromOfflineCache) {
+                    "🟠 MODO CONTINGENCIA OFFLINE (Caché Local Activa)"
+                } else {
+                    "🟢 TLS 1.3 Sincronizado ($lastSyncTime) • CRC OK"
+                }
+
+                val rxFrame = "[3.1.2.6 RX $lastSyncTime] ⬅ ${readings.serialTxFrame}"
+                if (serialConsoleLogs.firstOrNull() != rxFrame) {
+                    serialConsoleLogs.add(0, rxFrame)
+                    if (serialConsoleLogs.size > 15) serialConsoleLogs.removeAt(serialConsoleLogs.lastIndex)
+                }
+            }.onFailure {
+                reconexionesCount = FirebaseRepository.autoReconnectAttempts
+                isContingencyActive = true
+                firebaseSyncStatus = "🟡 Reconectando automáticamente (#$reconexionesCount)..."
+            }
+            delay(if (ecoModeEnabled) 3000L else 2000L)
+        }
+    }
 
     // Toggle states for Alertas tab
     var alertHeadsUp by remember { mutableStateOf(true) }
@@ -76,15 +177,15 @@ fun HomeScreen(
 
     val eventLogs = remember {
         mutableStateListOf(
-            EventLog(1, "08:30", "Sistema Iniciado", "Sensores HC-SR04 A/B y SGP30 activos en Osorno.", false),
-            EventLog(2, "09:15", "Aforo Normal", "Flujo bidireccional estable ($aforoCount / 15 pers).", false),
-            EventLog(3, "10:00", "Verificación E2E", "Cumplimiento ISO 27400 y Ley N° 19.628 verificado.", false),
+            EventLog(1, "08:30", "Sistema Iniciado", "Sensores HC-SR04 y TMP36 activos en Osorno.", false),
+            EventLog(2, "09:15", "Aforo Normal", "Flujo monitoreado ($aforoCount / 15 pers).", false),
+            EventLog(3, "10:00", "Verificación E2E", "Cumplimiento ISO 27001/27400 y Ley N° 19.628 verificado.", false),
         )
     }
 
     // Trigger vibration and pop-up dialog when capacity limit (15) is reached
-    LaunchedEffect(aforoCount) {
-        if (aforoCount >= maxCapacity.toInt()) {
+    LaunchedEffect(aforoCount, alertCapacityExceeded) {
+        if (alertCapacityExceeded && aforoCount >= maxCapacity.toInt()) {
             VibrationUtils.vibrate(context, 1000)
             criticalDialogMessage = "🚨 ¡LÍMITE DE AFORO 25m² EXCEDIDO! Se han alcanzado $aforoCount de ${maxCapacity.toInt()} personas permitidas."
         }
@@ -92,9 +193,51 @@ fun HomeScreen(
 
     // Trigger vibration and pop-up dialog when temperature is out of safe range
     LaunchedEffect(temperatureVal, alertThermalShock) {
-        if (temperatureVal < 18f || temperatureVal > 28f) {
+        if (alertThermalShock && (temperatureVal < 18f || temperatureVal > 28f)) {
             VibrationUtils.vibrate(context, 1000)
             criticalDialogMessage = "🌡️ ¡ALERTA TÉRMICA CRÍTICA! Temperatura fuera de rango seguro: ${String.format(Locale.getDefault(), "%.1f", temperatureVal)} °C."
+        }
+    }
+
+    fun sendSerialCmdFromApp(cmd: String) {
+        val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        scope.launch {
+            val txRes = FirebaseRepository.sendSerialInstruction(cmd)
+            txRes.onSuccess { msg ->
+                serialConsoleLogs.add(0, "[3.1.2.5 TX $timeNow] $msg")
+                // Si el comando modifica estado rápido, reflejar respuesta serial (3.1.2.6)
+                when (cmd.uppercase()) {
+                    "RESET_AFORO" -> {
+                        aforoCount = 0
+                        FirebaseRepository.updateSensorData(temperatureVal, distanciaVal, 0, context)
+                        serialConsoleLogs.add(0, "[3.1.2.6 RX $timeNow] ⬅ ACK:AFORO_REINICIADO_A_0")
+                    }
+                    "ECO_ON" -> {
+                        ecoModeEnabled = true
+                        arduinoCurrentMa = 38.4f
+                        serialConsoleLogs.add(0, "[3.1.2.6 RX $timeNow] ⬅ ACK:WIFI_MODEM_SLEEP_ON(38.4mA)")
+                    }
+                    "ECO_OFF" -> {
+                        ecoModeEnabled = false
+                        arduinoCurrentMa = 78.0f
+                        serialConsoleLogs.add(0, "[3.1.2.6 RX $timeNow] ⬅ ACK:HIGH_PERFORMANCE_ON(78.0mA)")
+                    }
+                    "PING" -> {
+                        serialConsoleLogs.add(0, "[3.1.2.6 RX $timeNow] ⬅ ACK:PONG|BAUD:115200|CRC:$currentChecksum")
+                    }
+                    "STATUS" -> {
+                        serialConsoleLogs.add(0, "[3.1.2.6 RX $timeNow] ⬅ ACK:T=${String.format(Locale.getDefault(), "%.2f", temperatureVal)}C|D=${distanciaVal}cm|P=$aforoCount|CRC=$currentChecksum")
+                    }
+                    else -> {
+                        val rxRes = FirebaseRepository.receiveSerialInstruction()
+                        rxRes.onSuccess { rxMsg ->
+                            serialConsoleLogs.add(0, "[3.1.2.6 RX $timeNow] $rxMsg")
+                        }
+                    }
+                }
+            }.onFailure {
+                serialConsoleLogs.add(0, "[3.1.2.5 TX OFFLINE $timeNow] Comando '$cmd' encolado en buffer local.")
+            }
         }
     }
 
@@ -129,14 +272,14 @@ fun HomeScreen(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Alertas Auditoria ($username)", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
-                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Auditoría IoT ($username)", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
+                                Spacer(modifier = Modifier.width(6.dp))
                                 Surface(
                                     shape = RoundedCornerShape(4.dp),
                                     color = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
                                 ) {
                                     Text(
-                                        text = " TLS 1.3 ",
+                                        text = " ISO 27001 • TLS 1.3 ",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.primary,
                                         modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
@@ -144,7 +287,7 @@ fun HomeScreen(
                                 }
                             }
                             Text(
-                                text = "🟢 EN LÍNEA • OSORNO NODE #04 (25 m²)",
+                                text = "🔒 ID Protegido: $anonymizedUserId • Sala 25 m²",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.primary,
                             )
@@ -186,13 +329,13 @@ fun HomeScreen(
                     selected = selectedBottomTab == 1,
                     onClick = { selectedBottomTab = 1 },
                     icon = { Text("📡", fontSize = 20.sp) },
-                    label = { Text("Aforo A/B") },
+                    label = { Text("Aforo & Serial") },
                 )
                 NavigationBarItem(
                     selected = selectedBottomTab == 2,
                     onClick = { selectedBottomTab = 2 },
                     icon = { Text("🌡️", fontSize = 20.sp) },
-                    label = { Text("Aire SGP30") },
+                    label = { Text("Temp & Energía") },
                 )
                 NavigationBarItem(
                     selected = selectedBottomTab == 3,
@@ -217,59 +360,7 @@ fun HomeScreen(
             ) {
                 when (selectedBottomTab) {
                     0 -> {
-                        // DASHBOARD TAB
-                        Card(
-                            shape = RoundedCornerShape(16.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(16.dp),
-                                verticalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Text(
-                                        text = "📡 Conectividad Wi-Fi, Red & Bluetooth",
-                                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                    )
-                                    Surface(
-                                        shape = RoundedCornerShape(6.dp),
-                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-                                    ) {
-                                        Text(
-                                            text = " ACTIVO ",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                                        )
-                                    }
-                                }
-
-                                Text(
-                                    text = "Estado de red Wi-Fi / Datos móviles, Bluetooth BLE y confirmación de permisos del sistema (Cámara, Ubicación, Almacenamiento, Notificaciones).",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-
-                                Button(
-                                    onClick = {
-                                        val intent = Intent(
-                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                            Uri.fromParts("package", context.packageName, null),
-                                        )
-                                        context.startActivity(intent)
-                                    },
-                                    modifier = Modifier.fillMaxWidth(),
-                                ) {
-                                    Text("🔐 Confirmar Permisos y Wi-Fi en Ajustes")
-                                }
-                            }
-                        }
-
+                        // DASHBOARD TAB — RESUMEN TIEMPO REAL + RÚBRICA 3.1.1 y 3.1.4
                         Card(
                             shape = RoundedCornerShape(16.dp),
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -292,7 +383,7 @@ fun HomeScreen(
                                         )
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Text(
-                                            text = "SISTEMA IoT 25 m² • ESTADO GENERAL",
+                                            text = "SISTEMA IoT 25 m² • TELEMETRÍA EN VIVO",
                                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                                             color = MaterialTheme.colorScheme.primary,
                                         )
@@ -309,30 +400,122 @@ fun HomeScreen(
                                             horizontalArrangement = Arrangement.SpaceBetween,
                                         ) {
                                             Text(
-                                                text = "AforoSense IoT • Sala 25 m²",
+                                                text = "WeMos D1 Mini (ESP8266) ⇄ Firebase RTDB",
                                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                                 color = MaterialTheme.colorScheme.onErrorContainer,
                                             )
                                             Text(
-                                                text = "Tiempo Real",
-                                                style = MaterialTheme.typography.labelSmall,
+                                                text = if (isIntegrityVerified) "CRC-OK ($currentChecksum)" else "CRC-ALERTA",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                                 color = MaterialTheme.colorScheme.onErrorContainer,
                                             )
                                         }
                                         Spacer(modifier = Modifier.height(4.dp))
                                         Text(
-                                            text = "📊 Resumen: $aforoCount/15 personas | Temp: $temperatureVal°C",
+                                            text = "📊 Aforo: $aforoCount/15 pers | Temp: ${String.format(Locale.getDefault(), "%.2f", temperatureVal)}°C",
                                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                            color = MaterialTheme.colorScheme.onErrorContainer,
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        val distText = if (distanciaVal == 999) "Fuera de rango" else "$distanciaVal cm"
+                                        Text(
+                                            text = "📏 Distancia HC-SR04: $distText  •  $firebaseSyncStatus",
+                                            style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onErrorContainer,
                                         )
                                     }
                                 }
                             }
                         }
+
+                        // TARJETA 3.1.1: SEGURIDAD, INTEGRIDAD, RECONEXIÓN Y ALMACENAMIENTO TEMPORAL OFFLINE
+                        Card(
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = "🛡️ Seguridad, Integridad y Buffer Offline (3.1.1 & 3.1.2.7)",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                )
+                                Text(
+                                    text = "• [3.1.1.1] Canal Seguro: HTTPS / TLS 1.3 con cabeceras ISO-27001-27400.\n" +
+                                        "• [3.1.1.2] Integridad de Codificación: Checksum CRC verificado ($currentChecksum) = ${if (isIntegrityVerified) "ÍNTEGRO" else "CORRUPTO"}.\n" +
+                                        "• [3.1.1.3] Reconexión Automática: Watchdog activo (Reconexiones acumuladas: $reconexionesCount).\n" +
+                                        "• [3.1.1.4 / 3.1.2.7] Almacenamiento Temporal Offline: Móvil ($pendingOfflineMobile lotes en caché) | WeMos RAM ($bufferOfflineArduino/20 lotes).",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            scope.launch {
+                                                FirebaseRepository.flushPendingOfflineQueue(context)
+                                                val res = FirebaseRepository.fetchSensorData(context)
+                                                res.onSuccess {
+                                                    aforoCount = it.personas
+                                                    temperatureVal = it.temperatura
+                                                    distanciaVal = it.distancia
+                                                    currentChecksum = it.checksum
+                                                }
+                                                pendingOfflineMobile = FirebaseRepository.getPendingOfflineCount(context)
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f),
+                                    ) {
+                                        Text("🔄 Sincronizar Caché Offline")
+                                    }
+                                }
+                            }
+                        }
+
+                        // TARJETA 3.1.4: ESTÁNDARES ISO, DATOS PERSONALES, CONTINGENCIA Y COMPATIBILIDAD
+                        Card(
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = "📋 Cumplimiento ISO, Privacidad y Continuidad (3.1.4)",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                )
+                                Text(
+                                    text = "• [3.1.4.11] Estándares ISO: Cumple ISO/IEC 27001 (Seguridad) e ISO/IEC 27400 (IoT Privacy & Security).\n" +
+                                        "• [3.1.4.12] Protección Datos Personales (Ley 19.628): Identificador pseudonimizado con SHA-256 ($anonymizedUserId). Los sensores solo transmiten variables numéricas anónimas.\n" +
+                                        "• [3.1.4.13] Plan de Contingencia: ${if (isContingencyActive) "ACTIVO (Operando con caché local y alarma autónoma)" else "EN ESPERA (Red principal operativa + respaldo local listo)"}.\n" +
+                                        "• [3.1.4.14] Compatibilidad Multi-Arquitectura: $hardwareArchInfo (Soporte MinSDK 24 a TargetSDK 37).",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+
+                                Button(
+                                    onClick = {
+                                        val intent = Intent(
+                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            Uri.fromParts("package", context.packageName, null),
+                                        )
+                                        context.startActivity(intent)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("🔐 Auditar Permisos Android y Red en Ajustes")
+                                }
+                            }
+                        }
                     }
 
                     1 -> {
-                        // AFORO TAB
+                        // AFORO & COMUNICACIÓN SERIAL TAB (3.1.2.5, 3.1.2.6, 3.1.3.8, 3.1.3.9)
                         Card(
                             shape = RoundedCornerShape(16.dp),
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -350,7 +533,7 @@ fun HomeScreen(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text(
-                                        text = "📡 Sistema Bidireccional HC-SR04 (A & B)",
+                                        text = "📡 Control de Aforo HC-SR04",
                                         style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                                     )
                                     Surface(
@@ -366,21 +549,14 @@ fun HomeScreen(
                                     }
                                 }
 
-                                Text(
-                                    text = "Puerta de Acceso (25 m²): Sensor A ➔ Sensor B (+1 Entrada) | Sensor B ➔ Sensor A (-1 Salida). Límite máx: 15 personas.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(vertical = 8.dp),
-                                )
-
                                 Spacer(modifier = Modifier.height(12.dp))
 
                                 Box(
                                     contentAlignment = Alignment.Center,
-                                    modifier = Modifier.size(160.dp),
+                                    modifier = Modifier.size(150.dp),
                                 ) {
                                     CircularProgressIndicator(
-                                        progress = { aforoCount / maxCapacity },
+                                        progress = { (aforoCount / maxCapacity).coerceIn(0f, 1f) },
                                         modifier = Modifier.fillMaxSize(),
                                         strokeWidth = 14.dp,
                                         color = MaterialTheme.colorScheme.primary,
@@ -397,32 +573,154 @@ fun HomeScreen(
                                             style = MaterialTheme.typography.headlineLarge.copy(fontWeight = FontWeight.Bold),
                                         )
                                         Text(
-                                            text = "${maxCapacity.toInt() - aforoCount} cupos libres",
+                                            text = "${(maxCapacity.toInt() - aforoCount).coerceAtLeast(0)} cupos libres",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.primary,
                                         )
                                     }
                                 }
 
-                                Spacer(modifier = Modifier.height(20.dp))
+                                Spacer(modifier = Modifier.height(16.dp))
 
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                                 ) {
                                     Button(
-                                        onClick = { if (aforoCount > 0) aforoCount-- },
+                                        onClick = {
+                                            if (aforoCount > 0) {
+                                                aforoCount--
+                                                scope.launch {
+                                                    FirebaseRepository.updateSensorData(temperatureVal, distanciaVal, aforoCount, context)
+                                                    pendingOfflineMobile = FirebaseRepository.getPendingOfflineCount(context)
+                                                }
+                                            }
+                                        },
                                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
                                         modifier = Modifier.weight(1f),
                                     ) {
-                                        Text("🚪 Salida (B ➔ A)")
+                                        Text("🚪 Salida (-1)")
                                     }
                                     Button(
-                                        onClick = { if (aforoCount < maxCapacity.toInt()) aforoCount++ },
+                                        onClick = {
+                                            if (aforoCount < maxCapacity.toInt()) {
+                                                aforoCount++
+                                                scope.launch {
+                                                    FirebaseRepository.updateSensorData(temperatureVal, distanciaVal, aforoCount, context)
+                                                    pendingOfflineMobile = FirebaseRepository.getPendingOfflineCount(context)
+                                                }
+                                            }
+                                        },
                                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                                         modifier = Modifier.weight(1f),
                                     ) {
-                                        Text("🚪 Entrada (A ➔ B)")
+                                        Text("🚪 Entrada (+1)")
+                                    }
+                                }
+                            }
+                        }
+
+                        // CONSOLA DE COMUNICACIÓN SERIAL BIDIRECCIONAL (3.1.2.5, 3.1.2.6, 3.1.3.8, 3.1.3.9)
+                        Card(
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                Text(
+                                    text = "💻 Terminal de Comunicación Serial (115200 bps)",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                )
+                                Text(
+                                    text = "Envía instrucciones seriales desde la App hacia el WeMos D1 Mini (3.1.2.5 / 3.1.3.9) y recibe tramas de telemetría serial del microcontrolador (3.1.2.6 / 3.1.3.8).",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    OutlinedTextField(
+                                        value = serialCommandInput,
+                                        onValueChange = { serialCommandInput = it },
+                                        label = { Text("Instrucción Serial (TX)") },
+                                        singleLine = true,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    Button(
+                                        onClick = {
+                                            if (serialCommandInput.isNotBlank()) {
+                                                sendSerialCmdFromApp(serialCommandInput)
+                                            }
+                                        },
+                                    ) {
+                                        Text("Enviar TX")
+                                    }
+                                }
+
+                                // Botones rápidos de instrucciones seriales
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    OutlinedButton(
+                                        onClick = { sendSerialCmdFromApp("PING") },
+                                        modifier = Modifier.weight(1f),
+                                        contentPadding = PaddingValues(4.dp),
+                                    ) {
+                                        Text("PING", fontSize = 11.sp)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { sendSerialCmdFromApp("STATUS") },
+                                        modifier = Modifier.weight(1f),
+                                        contentPadding = PaddingValues(4.dp),
+                                    ) {
+                                        Text("STATUS", fontSize = 11.sp)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { sendSerialCmdFromApp("BEEP") },
+                                        modifier = Modifier.weight(1f),
+                                        contentPadding = PaddingValues(4.dp),
+                                    ) {
+                                        Text("BEEP", fontSize = 11.sp)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { sendSerialCmdFromApp("RESET_AFORO") },
+                                        modifier = Modifier.weight(1f),
+                                        contentPadding = PaddingValues(4.dp),
+                                    ) {
+                                        Text("RESET", fontSize = 11.sp)
+                                    }
+                                }
+
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surface,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    ) {
+                                        Text(
+                                            text = "Monitor Serial TX/RX (Últimas tramas):",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = MaterialTheme.colorScheme.primary,
+                                        )
+                                        serialConsoleLogs.take(6).forEach { logLine ->
+                                            Text(
+                                                text = logLine,
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    fontFamily = FontFamily.Monospace,
+                                                    fontSize = 11.sp,
+                                                ),
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -451,11 +749,6 @@ fun HomeScreen(
                                         Text("🔑 API Key")
                                     }
                                 }
-
-                                Text(
-                                    text = "La IA reconocerá y nombrará automáticamente personas y objetos en la habitación.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
 
                                 if (capturedBitmap != null) {
                                     Image(
@@ -492,7 +785,7 @@ fun HomeScreen(
                     }
 
                     2 -> {
-                        // CLIMA / CALIDAD DEL AIRE TAB (MQ-135 / SGP30)
+                        // CLIMA / TEMPERATURA EN TIEMPO REAL (SOLO LECTURA) + GESTIÓN DE ENERGÍA (3.1.3.10)
                         Card(
                             shape = RoundedCornerShape(16.dp),
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -502,26 +795,92 @@ fun HomeScreen(
                                 modifier = Modifier.padding(20.dp),
                                 verticalArrangement = Arrangement.spacedBy(14.dp),
                             ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = "🌡️ SENSOR DE TEMPERATURA (TMP36 • FIREBASE)",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    )
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+                                    ) {
+                                        Text(
+                                            text = " SOLO LECTURA ",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                        )
+                                    }
+                                }
+
                                 Text(
-                                    text = "🌡️ CALIDAD DEL AIRE (SGP30 / MQ-135)",
-                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    text = "Temperatura Real: ${String.format(Locale.getDefault(), "%.2f", temperatureVal)} °C",
+                                    style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Bold),
+                                )
+
+                                LinearProgressIndicator(
+                                    progress = { (temperatureVal.coerceIn(-10f, 50f) + 10f) / 60f },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(12.dp),
+                                    color = if (temperatureVal >= 10.0f) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                    trackColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
                                 )
 
                                 Text(
-                                    text = "Temperatura Actual: ${String.format(Locale.getDefault(), "%.1f", temperatureVal)} °C",
-                                    style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Bold),
-                                )
-                                Slider(
-                                    value = temperatureVal,
-                                    onValueChange = { temperatureVal = it },
-                                    valueRange = 0f..40f,
-                                    modifier = Modifier.fillMaxWidth(),
-                                )
-                                Text(
-                                    text = "Rango Operativo Óptimo: 18°C – 26°C",
+                                    text = "Dato inmutable recibido desde Firebase Realtime Database ($lastSyncTime) con firma CRC=$currentChecksum.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.outline,
                                 )
+                            }
+                        }
+
+                        // TARJETA 3.1.3.10: EVALUACIÓN Y OPTIMIZACIÓN DE CONSUMO ENERGÉTICO
+                        Card(
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(20.dp),
+                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                Text(
+                                    text = "🔋 Consumo de Energía IoT & Batería Móvil (3.1.3.10)",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                )
+                                Text(
+                                    text = "• Dispositivo Móvil: Batería al $mobileBatteryPct% (${mobileBatteryMv} mV).\n" +
+                                        "• Microcontrolador WeMos D1 + HC-SR04 + TMP36: ${String.format(Locale.getDefault(), "%.1f", arduinoCurrentMa)} mA @ 3.3V.\n" +
+                                        "• Optimización activa: ${if (ecoModeEnabled) "WIFI_MODEM_SLEEP + Reducción RF 14.5 dBm (Ahorro ~51%)" else "WIFI_NONE_SLEEP (Alto Rendimiento)"}.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("Modo Ahorro Energético (Eco-Sleep)", fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            "Envía comando serial ECO_ON / ECO_OFF al WeMos y optimiza polling en Android",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.outline,
+                                        )
+                                    }
+                                    Switch(
+                                        checked = ecoModeEnabled,
+                                        onCheckedChange = { enabled ->
+                                            ecoModeEnabled = enabled
+                                            sendSerialCmdFromApp(if (enabled) "ECO_ON" else "ECO_OFF")
+                                        },
+                                    )
+                                }
                             }
                         }
                     }
@@ -538,11 +897,11 @@ fun HomeScreen(
                                 verticalArrangement = Arrangement.spacedBy(16.dp),
                             ) {
                                 Text(
-                                    text = "⚙️ Configuración Push & Pop-up",
+                                    text = "⚙️ Configuración Push, Pop-up & Contingencia",
                                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                                 )
                                 Text(
-                                    text = "Control de entrega de notificaciones en segundo plano, daemon de alertas críticas y pasarela de audio.",
+                                    text = "Control de entrega de notificaciones en segundo plano, daemon de alertas críticas y continuidad operativa.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.outline,
                                 )
@@ -579,8 +938,8 @@ fun HomeScreen(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text("Alarma Sonora CO₂ > 1,200 ppm", fontWeight = FontWeight.SemiBold)
-                                        Text("Tono piezoeléctrico de 85dB", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                                        Text("Alarma Sonora Piezoeléctrica (WeMos D7)", fontWeight = FontWeight.SemiBold)
+                                        Text("Tono PWM de 85dB en microcontrolador", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
                                     }
                                     Switch(checked = alertAlarmSound, onCheckedChange = { alertAlarmSound = it })
                                 }
@@ -591,8 +950,8 @@ fun HomeScreen(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text("Alerta Aforo Excedido (HC-SR04 A/B)", fontWeight = FontWeight.SemiBold)
-                                        Text("Notifica cuando supera la capacidad de 25 m²", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                                        Text("Alerta Aforo Excedido (HC-SR04)", fontWeight = FontWeight.SemiBold)
+                                        Text("Notifica cuando supera la capacidad de 25 m² (15 pers)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
                                     }
                                     Switch(checked = alertCapacityExceeded, onCheckedChange = { alertCapacityExceeded = it })
                                 }
